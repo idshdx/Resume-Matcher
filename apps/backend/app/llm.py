@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import re
 import threading
 from typing import Any, Literal
@@ -37,9 +38,9 @@ litellm.drop_params = True
 litellm.modify_params = True
 
 # LLM timeout configuration (seconds) - base values
-LLM_TIMEOUT_HEALTH_CHECK = 30
-LLM_TIMEOUT_COMPLETION = 120
-LLM_TIMEOUT_JSON = 180  # JSON completions may take longer
+LLM_TIMEOUT_HEALTH_CHECK = 60
+LLM_TIMEOUT_COMPLETION = 500
+LLM_TIMEOUT_JSON = 500  # JSON completions may take longer
 
 # JSON-010: JSON extraction safety limits
 MAX_JSON_EXTRACTION_RECURSION = 10
@@ -120,10 +121,12 @@ def _normalize_api_base(provider: str, api_base: str | None, model: str | None =
     append those segments internally, which can lead to duplicated paths like
     `/v1/v1/...` and cause 404s.
 
-    For the `openai` provider, LiteLLM uses the upstream OpenAI client which
-    handles `/v1` correctly — we MUST preserve whatever the user pasted so
-    that OpenAI-compatible endpoints like llama.cpp (http://localhost:8080/v1)
-    round-trip intact. See issue #751.
+    For `openai`, `openai_compatible`, and `openrouter` providers, LiteLLM uses
+    the upstream OpenAI client which does NOT append `/v1` — we MUST preserve
+    whatever the user pasted. For OpenRouter this means the full URL including
+    `/v1` must be kept (e.g. `https://openrouter.ai/api/v1`); stripping it
+    would produce `https://openrouter.ai/api/chat/completions` — a 404.
+    See issues #751, #780.
     """
     if not api_base:
         return None
@@ -133,6 +136,7 @@ def _normalize_api_base(provider: str, api_base: str | None, model: str | None =
         return None
 
     base = base.rstrip("/")
+
 
     # Azure AI Foundry can expose Azure OpenAI APIs under paths like
     # /openai/v1/responses. LiteLLM's Azure v1 client expects the service root
@@ -168,7 +172,7 @@ def _normalize_api_base(provider: str, api_base: str | None, model: str | None =
         return f"{parsed.scheme}://{netloc}"
 
     # OpenAI / OpenAI-compatible: preserve the URL as-is. The OpenAI client
-    # resolves paths correctly whether the base includes /v1 or not.
+    # resolves paths correctly whether the base includes /v1 or not. 7dd0423 (local work: backend llm/config updates, dockerignore, pyproject)
     if provider in ("openai", "openai_compatible"):
         return base or None
 
@@ -180,11 +184,6 @@ def _normalize_api_base(provider: str, api_base: str | None, model: str | None =
     # Gemini handler appends '/v1/models/...'. If base already ends with '/v1',
     # strip it to avoid '/v1/v1/models/...'.
     if provider == "gemini" and base.endswith("/v1"):
-        base = base[: -len("/v1")].rstrip("/")
-
-    # OpenRouter base is https://openrouter.ai/api/v1. LiteLLM appends /v1
-    # internally, so strip it to avoid /v1/v1.
-    if provider == "openrouter" and base.endswith("/v1"):
         base = base[: -len("/v1")].rstrip("/")
 
     # Ollama doesn't use /v1 paths. Strip common suffixes users might paste:
@@ -670,12 +669,13 @@ async def check_llm_health(
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": 64,
             "api_key": _effective_api_key(config.provider, config.api_key),
+
             "api_base": _normalize_api_base(config.provider, config.api_base, config.model),
             "timeout": LLM_TIMEOUT_HEALTH_CHECK,
         }
         api_version = _azure_foundry_api_version(config)
         if api_version:
-            kwargs["api_version"] = api_version
+            kwargs["api_version"] = api_version 7dd0423 (local work: backend llm/config updates, dockerignore, pyproject)
         if config.reasoning_effort:
             kwargs["reasoning_effort"] = config.reasoning_effort
 
@@ -739,12 +739,15 @@ async def check_llm_health(
         # Provide a minimal, actionable client-facing hint without leaking secrets.
         error_code = "health_check_failed"
         message = str(e)
-        if "404" in message and "/v1/v1/" in message:
+        # OpenRouter/provider HTML error pages often include a 404 in the body.
+        # Detect the HTML response first so the UI doesn't mislabel it as a
+        # generic/base-URL mismatch.
+        if "<!doctype html" in message.lower() or "<html" in message.lower():
+            error_code = "html_response"
+        elif "404" in message and "/v1/v1/" in message:
             error_code = "duplicate_v1_path"
         elif "404" in message:
             error_code = "not_found_404"
-        elif "<!doctype html" in message.lower() or "<html" in message.lower():
-            error_code = "html_response"
         result = {
             "healthy": False,
             "provider": config.provider,
@@ -852,19 +855,22 @@ def _is_response_format_unsupported(error: Exception) -> bool:
     the ``{"type": "json_object"}`` we send for JSON mode, returning a 400 such
     as ``'response_format.type' must be 'json_schema' or 'text'`` (issue #857).
 
+    Some providers also phrase this as ``response format`` without an underscore,
+    so check both spellings to avoid missing the rejection cue.
+
     Detecting this lets ``complete_json`` fall back to prompt-only JSON mode
     instead of failing the whole request, while genuine bad requests (e.g.
     context-length errors) still propagate.
 
-    Requires both a mention of ``response_format`` *and* a rejection/validation
-    cue, so that an unrelated 400 which merely names the parameter (e.g. a
-    context-length error) does not trigger a pointless fallback retry. The cue
-    list stays broad enough to catch varied provider wording ("must be ...",
-    "not supported", "unsupported", "not allowed", "invalid") rather than any
-    single provider's exact message.
+    Requires both a mention of ``response_format``/``response format`` *and* a
+    rejection/validation cue, so that an unrelated 400 which merely names the
+    parameter (e.g. a context-length error) does not trigger a pointless
+    fallback retry. The cue list stays broad enough to catch varied provider
+    wording ("must be ...", "not supported", "unsupported", "not allowed",
+    "invalid") rather than any single provider's exact message.
     """
     msg = str(error).lower()
-    if "response_format" not in msg:
+    if "response_format" not in msg and "response format" not in msg:
         return False
     rejection_cues = ("must be", "not support", "unsupported", "not allowed", "invalid")
     return any(cue in msg for cue in rejection_cues)

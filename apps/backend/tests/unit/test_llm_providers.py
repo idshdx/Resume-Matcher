@@ -3,7 +3,7 @@
 These are the pure functions where local-LLM (Ollama / openai_compatible) bugs
 live, and they pin behavior we recently shipped:
   - get_model_name        — LiteLLM provider prefixing (Ollama, OpenRouter nesting)
-  - _normalize_api_base   — the /v1/v1 duplicate-path fix (issue #751) + Ollama suffixes
+  - _normalize_api_base   — URL normalization for each provider + Ollama suffixes
   - resolve_api_key       — the security rule that local providers do NOT inherit
                             the env LLM_API_KEY (so a paid key can't leak to a
                             self-hosted server)
@@ -107,8 +107,21 @@ class TestNormalizeApiBase:
     def test_gemini_strips_v1(self):
         assert _normalize_api_base("gemini", "https://host/v1") == "https://host"
 
-    def test_openrouter_strips_v1(self):
-        assert _normalize_api_base("openrouter", "https://openrouter.ai/api/v1") == "https://openrouter.ai/api"
+    def test_openrouter_preserves_v1_as_is(self):
+        # OpenRouter: LiteLLM does NOT append /v1 for openrouter — the api_base is
+        # used verbatim, so we must preserve the full URL (including /v1) the user
+        # pasted. Stripping /v1 would produce https://openrouter.ai/api/chat/completions
+        # (a 404 that returns HTML). Fixes issue #780.
+        assert (
+            _normalize_api_base("openrouter", "https://openrouter.ai/api/v1")
+            == "https://openrouter.ai/api/v1"
+        )
+
+    def test_openrouter_strips_only_trailing_slash(self):
+        assert (
+            _normalize_api_base("openrouter", "https://openrouter.ai/api/v1/")
+            == "https://openrouter.ai/api/v1"
+        )
 
     @pytest.mark.parametrize(
         "pasted",

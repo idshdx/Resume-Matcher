@@ -60,3 +60,6 @@ docker-compose.yml
 # Config file with API keys - NEVER COMMIT
 config.json
 **/config.json
+/personal/
+
+/scripts/
