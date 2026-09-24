@@ -138,3 +138,11 @@ config.json
 !/personal/
 
 scripts/
+
+# Agent tooling
+.agentbridge/
+.ai/
+.junie/
+.kiro/
+.vscode/
+mcp-servers.json
